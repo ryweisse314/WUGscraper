@@ -1,5 +1,6 @@
 import re
 import csv
+import tempfile
 import calendar
 import datetime as dt
 from pathlib import Path
@@ -40,6 +41,18 @@ def month_dates(year: int, month: int) -> List[dt.date]:
 
 def build_url(base_url: str, date_obj: dt.date) -> str:
     return f"{base_url}/{date_obj.year}-{date_obj.month}-{date_obj.day}"
+
+def cleanup_old_temp_csvs(prefix: str = "tmp", max_age_hours: int = 24) -> None:
+    temp_dir = Path(tempfile.gettempdir())
+    cutoff = dt.datetime.now() - dt.timedelta(hours=max_age_hours)
+    for p in temp_dir.glob("*.csv"):
+        try:
+            mtime = dt.datetime.fromtimestamp(p.stat().st_mtime)
+            if mtime < cutoff:
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 
 # =========================
 # In-page extractor JS
@@ -209,7 +222,15 @@ def run_month_scrape(base_url: str, location_label: str, year: int, month: int, 
 
     # Timestamped output prevents Windows PermissionError if user has an older CSV open in Excel.
     safe_loc = re.sub(r"[^A-Za-z0-9]+", "_", location_label).strip("_")
-    out_path = Path(f"trends_{safe_loc}_{year}_{month:02d}_{dt.datetime.now():%Y%m%d_%H%M%S}.csv")
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=f"_{safe_loc}_{year}_{month:02d}.csv",
+        delete=False,
+        encoding=CSV_ENCODING,
+        newline=""
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
 
     all_rows: List[Dict[str, str]] = []
     canonical_headers_out: Optional[List[str]] = None
@@ -297,10 +318,10 @@ def run_month_scrape(base_url: str, location_label: str, year: int, month: int, 
             fr[h] = r.get(h, "")
         filtered_rows.append(fr)
 
-    write_csv(out_path, filtered_rows, fieldnames)
+    write_csv(tmp_path, filtered_rows, fieldnames)
 
-    log_lines.append(f"\nDone. Wrote {len(all_rows)} rows to: {out_path.resolve()}")
-    return str(out_path), "\n".join(log_lines)
+    log_lines.append(f"\nDone. Wrote {len(all_rows)} rows to: {tmp_path.resolve()}")
+    return str(tmp_path), "\n".join(log_lines)
 
 # =========================
 # Gradio UI
@@ -402,4 +423,6 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
+    cleanup_old_temp_csvs(max_age_hours=24)
     app.launch()
+
