@@ -10,9 +10,6 @@ import gradio as gr
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
-# =========================
-# CONFIG (edit these)
-# =========================
 LOCATION_URLS = {
     "G. A. Wintzer - Wapakoneta": "https://www.wunderground.com/history/daily/us/oh/new-knoxville/KAXV/date",
     "Bardot - Nazareth": "https://www.wunderground.com/history/daily/us/pa/allentown/KABE/date",
@@ -32,9 +29,6 @@ DATE_COLUMN = "Date"
 # Uses a BOM so Excel opens UTF-8 correctly (prevents Â° artifacts)
 CSV_ENCODING = "utf-8-sig"
 
-# =========================
-# Utilities
-# =========================
 def month_dates(year: int, month: int) -> List[dt.date]:
     last_day = calendar.monthrange(year, month)[1]
     return [dt.date(year, month, day) for day in range(1, last_day + 1)]
@@ -52,6 +46,63 @@ def cleanup_old_temp_csvs(prefix: str = "tmp", max_age_hours: int = 24) -> None:
                 p.unlink(missing_ok=True)
         except Exception:
             pass
+
+# ---------------------------
+# Date range helpers
+# ---------------------------
+def parse_date_input(d) -> Optional[dt.date]:
+    """
+    Accepts:
+      - None -> returns None
+      - datetime.date -> returns as-is
+      - datetime.datetime -> returns .date()
+      - str in ISO 'YYYY-MM-DD' -> parsed to date
+      - int/float Unix timestamp (seconds or milliseconds) -> converted to date
+
+    Returns datetime.date or None.
+    """
+    if d is None:
+        return None
+
+    # numeric timestamp (seconds or milliseconds)
+    if isinstance(d, (int, float)):
+        # Some frontends return milliseconds (ms) instead of seconds.
+        # Heuristic: if value > 1e12 assume milliseconds, convert to seconds.
+        ts = float(d)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        try:
+            return dt.datetime.fromtimestamp(ts).date()
+        except Exception as e:
+            raise ValueError(f"Invalid numeric timestamp for date: {d} ({e})")
+
+    if isinstance(d, dt.datetime):
+        return d.date()
+
+    if isinstance(d, dt.date):
+        return d
+
+    if isinstance(d, str):
+        # permissive: try isoformat first, then fallback to parsing common formats
+        try:
+            return dt.date.fromisoformat(d)
+        except Exception:
+            # try a couple common formats
+            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
+                try:
+                    return dt.datetime.strptime(d, fmt).date()
+                except Exception:
+                    pass
+        raise ValueError(f"Unsupported date string format: {d!r}")
+
+    raise ValueError(f"Unsupported date input type: {type(d)}")
+
+def date_range_dates(start: dt.date, end: dt.date) -> List[dt.date]:
+    """Return inclusive list of dates from start to end (start <= end required)."""
+    if end < start:
+        raise ValueError("end date must be >= start date")
+    days = (end - start).days
+    return [start + dt.timedelta(days=i) for i in range(days + 1)]
 
 
 # =========================
@@ -323,23 +374,146 @@ def run_month_scrape(base_url: str, location_label: str, year: int, month: int, 
     log_lines.append(f"\nDone. Wrote {len(all_rows)} rows to: {tmp_path.resolve()}")
     return str(tmp_path), "\n".join(log_lines)
 
+def run_date_range_scrape(base_url: str, location_label: str, start_date_in, end_date_in, selected_columns: Optional[list[str]] = None) -> tuple[Optional[str], str]:
+    """
+    Like run_month_scrape but accepts a start + end date (inclusive).
+    start_date_in and end_date_in can be str or datetime.date/datetime.
+    Returns (csv_path, log_text)
+    """
+    start_date = parse_date_input(start_date_in)
+    end_date = parse_date_input(end_date_in)
+    if start_date is None or end_date is None:
+        return None, "Start date and end date must both be provided."
+
+    try:
+        dates = date_range_dates(start_date, end_date)
+    except ValueError as e:
+        return None, f"Invalid date range: {e}"
+
+    today = dt.date.today()
+
+    safe_loc = re.sub(r"[^A-Za-z0-9]+", "_", location_label).strip("_")
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=f"_{safe_loc}_{start_date.isoformat()}_to_{end_date.isoformat()}.csv",
+        delete=False,
+        encoding=CSV_ENCODING,
+        newline=""
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
+
+    all_rows: List[Dict[str, str]] = []
+    canonical_headers_out: Optional[List[str]] = None
+
+    log_lines: List[str] = []
+    log_lines.append(f"Scraping {location_label} — {start_date.isoformat()} → {end_date.isoformat()}")
+    log_lines.append(f"Base URL: {base_url}")
+    log_lines.append(f"Today is {today.isoformat()}\n")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context()
+        page = context.new_page()
+
+        for d in dates:
+            if d > today:
+                log_lines.append(f"[SKIP] {d.isoformat()} is in the future (no data yet).")
+                continue
+
+            try:
+                headers, rows = scrape_one_day(page, base_url, d)
+
+                if not rows:
+                    tag = "today/partial" if d == today else "past"
+                    log_lines.append(f"[NO DATA] {d.isoformat()} ({tag}) table has 0 rows. Skipping.")
+                    continue
+
+                units = infer_units_from_rows(headers, rows)
+                rows = strip_units_in_rows(headers, rows, units)
+                headers_out = apply_units_to_headers(headers, units)
+                header_out_name = {h: (f"{h} ({units[h]})" if h in units else h) for h in headers}
+
+                if canonical_headers_out is None:
+                    canonical_headers_out = headers_out
+
+                for r in rows:
+                    day_map = {headers[i]: r[i] for i in range(min(len(headers), len(r)))}
+                    out = {"Date": d.isoformat()}
+                    for orig_h in headers:
+                        out_name = header_out_name[orig_h]
+                        out[out_name] = day_map.get(orig_h, "")
+                    all_rows.append(out)
+
+                if d == today:
+                    log_lines.append(f"[OK] {d.isoformat()} (today/partial) -> {len(rows)} rows")
+                else:
+                    log_lines.append(f"[OK] {d.isoformat()} -> {len(rows)} rows")
+
+            except Exception as e:
+                if d == today:
+                    log_lines.append(f"[NO DATA] {d.isoformat()} (today) not ready / table missing. Skipping. ({e})")
+                else:
+                    log_lines.append(f"[WARN] {d.isoformat()} failed: {e} (skipping)")
+
+        browser.close()
+
+    if not canonical_headers_out:
+        return None, "\n".join(log_lines + ["\nNo days were successfully scraped; nothing to write."])
+
+    # Column filtering + CSV write: same as run_month_scrape
+    selected_set = set(selected_columns or [])
+    if not selected_set:
+        selected_headers = canonical_headers_out
+    else:
+        selected_headers = [h for h in canonical_headers_out if h in selected_set]
+
+    for required in HIDDEN_ALWAYS_INCLUDE:
+        if required in canonical_headers_out and required not in selected_headers:
+            selected_headers.insert(0, required)
+
+    fieldnames = [DATE_COLUMN] + selected_headers
+
+    filtered_rows = []
+    for r in all_rows:
+        fr = {"Date": r.get("Date", "")}
+        for h in selected_headers:
+            fr[h] = r.get(h, "")
+        filtered_rows.append(fr)
+
+    write_csv(tmp_path, filtered_rows, fieldnames)
+
+    log_lines.append(f"\nDone. Wrote {len(all_rows)} rows to: {tmp_path.resolve()}")
+    return str(tmp_path), "\n".join(log_lines)
+
+
 # =========================
 # Gradio UI
 # =========================
 
-def gradio_load_columns(location_label: str, year: int, month: int):
-    # Pick the first day in the month that is not in the future (prefer today or earlier)
+def gradio_load_columns(location_label: str, start_date_in, end_date_in):
+    start_date = parse_date_input(start_date_in)
+    end_date = parse_date_input(end_date_in)
+    if start_date is None or end_date is None:
+        return gr.update(choices=[], value=[]), "Please select both start and end dates."
+
+    try:
+        dates = date_range_dates(start_date, end_date)
+    except ValueError as e:
+        return gr.update(choices=[], value=[]), f"Invalid date range: {e}"
+
     today = dt.date.today()
-    dates = month_dates(year, month)
-    probe = None
     base_url = LOCATION_URLS[location_label]
-    for d in dates:
+
+    # Probe the most recent date in the range that is not in the future (end -> start)
+    probe = None
+    for d in reversed(dates):
         if d <= today:
             probe = d
             break
 
     if probe is None:
-        return gr.update(choices=[], value=[]), "All days in that month are in the future. No columns to load yet."
+        return gr.update(choices=[], value=[]), "All selected dates are in the future. No columns to load yet."
 
     log_lines = [f"Loading columns for {location_label} from {probe.isoformat()} ..."]
 
@@ -360,14 +534,13 @@ def gradio_load_columns(location_label: str, year: int, month: int):
 
             browser.close()
 
-        # Show unitized headers as choices; default select all of them
         return gr.update(choices=headers_out, value=headers_out), "\n".join(log_lines + ["Columns loaded."])
     except Exception as e:
         return gr.update(choices=[], value=[]), "\n".join(log_lines + [f"Failed to load columns: {e}"])
 
-def gradio_run(location_label: str, year: int, month: int, selected_columns: list[str]):
+def gradio_run(location_label: str, start_date_in, end_date_in, selected_columns: list[str]):
     base_url = LOCATION_URLS[location_label]
-    csv_path, log_text = run_month_scrape(base_url, location_label, year, month, selected_columns)
+    csv_path, log_text = run_date_range_scrape(base_url, location_label, start_date_in, end_date_in, selected_columns)
     if not csv_path:
         return None, log_text
     return csv_path, log_text
@@ -386,9 +559,21 @@ def build_app():
             label="Location"
         )
 
+        # with gr.Row():
+        #     year_in = gr.Dropdown(choices=years, value=dt.date.today().year, label="Year")
+        #     month_in = gr.Dropdown(choices=months, value=dt.date.today().month, label="Month")
+
+        # import dt at top already present
         with gr.Row():
-            year_in = gr.Dropdown(choices=years, value=dt.date.today().year, label="Year")
-            month_in = gr.Dropdown(choices=months, value=dt.date.today().month, label="Month")
+            # use datetime objects (not date objects) as initial values
+            start_date_in = gr.DateTime(
+                value=dt.datetime.combine(dt.date.today().replace(day=1), dt.time(0, 0)),
+                label="Start date"
+            )
+            end_date_in = gr.DateTime(
+                value=dt.datetime.combine(dt.date.today(), dt.time(0, 0)),
+                label="End date"
+            )
 
         with gr.Row():
             load_cols_btn = gr.Button("Load available columns")
@@ -401,13 +586,13 @@ def build_app():
 
         load_cols_btn.click(
             fn=gradio_load_columns,
-            inputs=[location_in, year_in, month_in],
+            inputs=[location_in, start_date_in, end_date_in],
             outputs=[cols_in, log_out],
         )
 
         run_btn.click(
-            fn=gradio_run,
-            inputs=[location_in, year_in, month_in, cols_in],
+            fn=lambda location_label, s, e, cols: gradio_run(location_label, s, e, cols),
+            inputs=[location_in, start_date_in, end_date_in, cols_in],
             outputs=[file_out, log_out],
         )
 
