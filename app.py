@@ -105,9 +105,9 @@ def date_range_dates(start: dt.date, end: dt.date) -> List[dt.date]:
     return [start + dt.timedelta(days=i) for i in range(days + 1)]
 
 
-# =========================
+# ========================
 # In-page extractor JS
-# =========================
+# ========================
 JS_EXTRACT_DAILY_OBS_TABLE = r"""
 () => {
   const table = document.querySelector(".observation-table table");
