@@ -579,7 +579,7 @@ def build_app():
             load_cols_btn = gr.Button("Load available columns")
             cols_in = gr.CheckboxGroup(choices=[], value=[], label="Columns to include (Date always included)")
 
-        run_btn = gr.Button("Run scrape")
+        run_btn = gr.Button("Run scrape (wait time ~ 1 minute per month scraped")
 
         file_out = gr.File(label="Download CSV")
         log_out = gr.Textbox(label="Log", lines=18)
@@ -599,9 +599,7 @@ def build_app():
         gr.Markdown(
             "**Notes**\n"
             "- Future dates are skipped automatically.\n"
-            "- Today may be partial.\n"
             "- Units are moved into headers; cells contain numbers only.\n"
-            "- Output is UTF-8 with BOM for Excel compatibility.\n"
         )
 
     return demo
